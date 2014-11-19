@@ -1,0 +1,981 @@
+#!/usr/bin/env python
+
+'''
+This is a CUPS backend for printing via IPP(S) to a Windows print server using
+NTLM authentication.
+
+Requires: python-ntlm from http://code.google.com/p/python-ntlm/
+          pkipplib from http://pypi.python.org/pypi/pkipplib
+
+If using Python < 2.5, python-ntlm requires hashlib from http://pypi.python.org/pypi/hashlib, 
+compiled with OpenSSL libraries in order to provide the MD4 algorithm
+
+In order to use this backend, copy it to the CUPS backend folder 
+(/usr/lib/cups/backend) named "ntlm" (rename if necessary), make sure it's 
+owned by root user and group, and make sure the permissions on the file are 
+at least 500 (it should at least be readable and executable by owner).  Then, 
+restart the CUPS service.
+
+To add a printer, get the IPP URI of the printer for the Windows server, and 
+change it so it's in the following format:
+
+ntlm://DOMAIN\username:password@print-server:port/resource?option=value
+
+All IPP options are valid, and an additional option, "debug," has been added. 
+To use debugging, set the debug value to "true".
+
+Here's an example of a valid printer URI for the NTLM backend:
+
+ntlm://MYDOMAIN\myuser:mypass@my-print-server.example.com:443/printers/myprinter/.printer?encryption=always&waitjob=false&debug=true
+
+See here for more information on IPP printer URIs:
+http://www.cups.org/documentation.php/doc-1.4/network.html#IPP
+'''
+
+import gzip
+import os
+import signal
+import struct  # used for handling error messages when parsing IPP response data
+import sys
+import time
+import urllib2
+import urlparse  # used to parse printer URI
+
+from ntlm import HTTPNtlmAuthHandler
+from pkipplib import pkipplib
+
+if sys.version_info < (2, 5):
+    import re  # used for parsing printer URI netloc
+# in Python 2.6, cgi.parse_qs is deprecated.  use urlparse.parse_qs instead
+if sys.version_info < (2, 6):
+    import cgi  # used for parsing query strings (.parse_qs)
+
+
+# backend exit codes, from cups-1.3.7/cups/backend.h 28-33
+CUPS_BACKEND_OK            = 0  # Job completed successfully
+CUPS_BACKEND_FAILED        = 1  # Job failed, use error-policy
+CUPS_BACKEND_AUTH_REQUIRED = 2  # Job failed, authentication required
+CUPS_BACKEND_HOLD          = 3  # Job failed, hold job
+CUPS_BACKEND_STOP          = 4  # Job failed, stop queue
+CUPS_BACKEND_CANCEL        = 5  # Job failed, cancel job
+
+# printer attributes we want, from cups-1.3.7/backend/ipp.c 141-149
+requested_printer_attributes = [
+                                'copies-supported',
+                                'document-format-supported',
+                                'printer-is-accepting-jobs',
+                                'printer-state',
+                                'printer-state-message',
+                                'printer-state-reasons',
+                               ]
+# job attributes we want, from cups-1.3.7/backend/ipp.c 150-154
+requested_job_attributes = [
+                            'job-media-sheets-completed',
+                            'job-state',
+                           ]
+
+# check to see whether we're running on OS X
+if sys.platform == 'darwin':
+    is_osx = True
+else:
+    is_osx = False
+
+
+def main():
+    global compression
+    global job_cancelled; job_cancelled = False
+    global temp_filenames; temp_filenames = []
+
+    # cups-1.3.7/backend/ipp.c 157-161
+    # disable buffering of stderr
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', 0)
+
+    # cups-1.3.7/backend/ipp.c 163-182
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    args = parse_args()
+    
+    # cups-1.3.7/backend/ipp.c 209-214
+    if 'CONTENT_TYPE' not in os.environ or \
+            os.environ['CONTENT_TYPE'] == '':
+        content_type = 'application/octet-stream'
+    else:
+        content_type = os.environ['CONTENT_TYPE']
+    # cups-1.3.7/backend/ipp.c 215-222
+    if 'FINAL_CONTENT_TYPE' not in os.environ or \
+            os.environ['FINAL_CONTENT_TYPE'] == '':
+        final_content_type = content_type
+        if final_content_type.startswith('printer/'):
+            final_content_type = 'application/vnd.cups-raw'
+    else:
+        final_content_type = os.environ['FINAL_CONTENT_TYPE']
+
+    printer_uri = None
+    # get the printer URI and extract values from it
+    try:
+        # try to get the printer URI string from the environment variable
+        printer_uri = separate_uri(os.environ['DEVICE_URI'])
+    except KeyError:  # otherwise get it from CUPS, but it'll have the username and password stripped out
+        cups_conn = pkipplib.CUPS()
+        
+        # get the job attributes of the current job
+        job_attributes = cups_conn.getJobAttributes(int(args['job_id']))
+        
+        # get the CUPS printer uri from the job attributes
+        cups_printer_uri = job_attributes.job['printer-uri'][0][1]
+        
+        # generate an IPP request for the printer attributes to get the device URI
+        request = cups_conn.newRequest(pkipplib.IPP_GET_PRINTER_ATTRIBUTES)
+        request.operation['printer-uri'] = ('uri', cups_printer_uri)
+        # unfortunately this next line doesn't seem to limit the results
+        request.operation['requested-attributes'] = ('uri', 'device-uri')
+        ipp_response = cups_conn.doRequest(request)
+        device_uri = ipp_response.printer['device-uri'][0][1]
+        printer_uri = separate_uri(device_uri)
+    if printer_uri == None:
+        sys.stderr.write('ERROR: No DEVICE_URI environment variable and '
+                         'unable to get device URI from CUPS!\n')
+        sys.exit(CUPS_BACKEND_STOP)
+
+    # cups-1.3.7/backend/ipp.c 239-240
+    if (printer_uri.port == None) or (printer_uri.port == ''):
+        ntlm_port = pkipplib.IPP_PORT
+    else:
+        ntlm_port = printer_uri.port
+
+    # cups-1.3.7/backend/ipp.c 247-388
+    compression = False
+    ipp_version = [1, 0]
+    waitjob = True
+    waitprinter = True
+    contimeout = 7 * 24 * 60 * 60
+    encryption = False
+    debug = False
+
+    if printer_uri.options != {}:
+        for option in printer_uri.options:
+            values = printer_uri.options[option]
+            if option == 'waitjob':
+                if ('on' not in values) and ('yes' not in values) and \
+                        ('true' not in values):
+                    waitjob = False
+            elif option == 'waitprinter':
+                if ('on' not in values) and ('yes' not in values) and \
+                        ('true' not in values):
+                    waitprinter = False
+            elif option == 'encryption':
+                if ('always' in values) or ('required' in values) or \
+                        ('ifrequested' in values):
+                    encryption = True
+                elif ('never' not in values):
+                    sys.stderr.write('ERROR: Unknown encryption option value '
+                                     '"%s"!\n' % (values))
+            elif option == 'version':
+                if '1.0' in values:
+                    break
+                elif ('1.1' in values) or ('2.0' in values) or \
+                        ('2.1' in values):
+                    sys.stderr.write('ERROR: Microsoft only supports version '
+                                     '1.0 of the IPP protocol at this time!\n')
+                else:
+                    sys.stderr.write('ERROR: Unknown version option values '
+                                     '"%s"!\n' % (values))
+            elif option == 'compression':
+                if ('true' in values) or ('yes' in values) or \
+                        ('on' in values) or ('gzip' in values):
+                    compression = True
+            elif option == 'contimeout':
+                for value in values:
+                    try:
+                        if int(value) > 0:
+                            contimeout = int(value)
+                    except:
+                        sys.stderr.write('ERROR: Unknown contimeout option '
+                                         'value "%s"!\n' % (value))
+            elif option == 'debug':
+                if ('on' in values) or ('yes' in values) or \
+                        ('true' in values) or ('1' in values) or \
+                        (1 in values):
+                    debug = True
+            else:
+                sys.stderr.write('ERROR: Unknown option "%s" with value '
+                                 '"%s"!\n' % (option, value))
+
+    if debug:
+        sys.stderr.write('DEBUG: printer_uri.scheme: %s\n' % 
+                         (printer_uri.scheme))
+        sys.stderr.write('DEBUG: printer_uri.username: %s\n' % 
+                         (printer_uri.username))
+        sys.stderr.write('DEBUG: printer_uri.hostname: %s\n' % 
+                         (printer_uri.hostname))
+        sys.stderr.write('DEBUG: printer_uri.port: %s\n' % (printer_uri.port))
+        sys.stderr.write('DEBUG: printer_uri.path: %s\n' % (printer_uri.path))
+        sys.stderr.write('DEBUG: printer_uri.query: %s\n' % 
+                         (printer_uri.query))
+        sys.stderr.write('DEBUG: printer_uri.options: %s\n' % 
+                         (printer_uri.options))
+        
+        sys.stderr.write('DEBUG: content_type: %s\n' % (content_type))
+        sys.stderr.write('DEBUG: final_content_type: %s\n' % 
+                         (final_content_type))
+        
+        sys.stderr.write('DEBUG: waitjob: %s\n' % (waitjob))
+        sys.stderr.write('DEBUG: waitprinter: %s\n' % (waitprinter))
+        sys.stderr.write('DEBUG: encryption: %s\n' % (encryption))
+        sys.stderr.write('DEBUG: compression: %s\n' % (compression))
+        sys.stderr.write('DEBUG: contimeout: %s\n' % (contimeout))
+
+    # cups-1.3.7/backend/ipp.c 390-441
+    if len(sys.argv) == 6:  # if we weren't passed a file, send stdin to temporary file and print it
+        temp_filename = create_temp_filename()
+        try:
+            if compression:
+                temp_file = gzip.open(temp_filename, 'wb')
+            else:
+                temp_file = open(temp_filename, 'w')
+            temp_file.write(sys.stdin.read())
+            temp_file.close()
+        except IOError, error:
+            sys.stderr.write('ERROR: IOError: %s\n' % (error))
+            sys.exit(CUPS_BACKEND_FAILED)
+        filename = temp_filename
+        num_files = 1
+        files = [temp_filename]
+        send_options = False
+    # cups-1.3.7/backend/ipp.c 442-456
+    else:  # otherwise, print file(s)
+        num_files = len(args['job_files'])
+        files = args['job_files']
+        send_options = True
+        if compression:
+            files = compress_files[files]
+        sys.stderr.write('DEBUG: %d files to send in job...\n' % (num_files))
+
+    if debug:
+        sys.stderr.write('DEBUG: files: %s\n' % (files))
+
+    if (ntlm_port == 443) or encryption:
+        ntlm_url_scheme = 'https'
+    else:
+        ntlm_url_scheme = 'http'
+
+    # cups-1.3.7/backend/ipp.c 609
+    ntlm_url = '%s://%s:%s%s' % (ntlm_url_scheme, printer_uri.hostname, 
+                                  ntlm_port, printer_uri.path)
+    
+    if debug:
+        sys.stderr.write('DEBUG: ntlm_url: %s\n' % (ntlm_url))
+      
+    ntlm_conn = ntlmConn(ntlm_url, username = printer_uri.username, 
+                                  password = printer_uri.password)
+    
+    # cups-1.3.7/backend/ipp.c 627-631
+    request = ntlm_conn.newRequest(pkipplib.IPP_GET_PRINTER_ATTRIBUTES)
+    request.operation['printer-uri'] = ('uri', ntlm_url)
+    for attribute in requested_printer_attributes:
+        request.operation['requested-attributes'] = ('nameWithoutLanguage', 
+                                                     attribute)
+    ipp_response = ntlm_conn.doRequest(request)
+
+    # cups-1.3.7/backend/ipp.c 495-499
+    delay = 5
+    recoverable = False
+    start_time = time.time()
+    sys.stderr.write('STATE: +connecting-to-device\n')
+
+    # cups-1.3.7/backend/ipp.c 506-
+    while ipp_response == None:
+        if job_cancelled:
+            break
+             
+        if 'CLASS' in os.environ:
+            sys.stderr.write('INFO: Unable to contact printer, queuing on '
+                             'next printer in class...\n')
+            # delete all temp files that were created
+            for file in temp_filenames:
+                os.remove(file)
+            time.sleep(5)
+            sys.exit(CUPS_BACKEND_FAILED)
+
+        ipp_response = ntlm_conn.doRequest(request)
+
+    # cups-1.3.7/backend/ipp.c 580-586
+    if job_cancelled:
+        # delete all temp files that were created
+        for file in temp_filenames:
+            os.remove(file)
+        sys.exit(CUPS_BACKEND_FAILED)
+    
+    while ipp_response.operation_id > pkipplib.IPP_OK_CONFLICT:
+        # cups-1.3.7/backend/ipp.c 650-707
+        if ipp_response.operation_id == pkipplib.IPP_PRINTER_BUSY or \
+            ipp_response.operation_id == pkipplib.IPP_SERVICE_UNAVAILABLE:
+                if contimeout > time.time() - start_time:
+                    sys.stderr.write('ERROR: Printer not responding!\n')
+                    sys.exit(CUPS_BACKEND_FAILED)
+                recoverable = True
+                sys.stderr.write('WARNING: recoverable: Network host '
+                        '\'%s\' is busy; will retry in %d seconds...\n' %
+                        (printer_uri.hostname, delay))
+                report_printer_state(ipp_response, args['job_id'])
+                time.sleep(delay)
+                if delay < 30:
+                    delay += 5
+        elif ipp_response.operation_id == pkipplib.IPP_BAD_REQUEST or \
+                ipp_response.operation_id == pkipplib.IPP_VERSION_NOT_SUPPORTED and \
+                request.version[0] >= 1 and \
+                request.version[1] > 0:
+            sys.stderr.write('INFO: Printer does not support IPP/%d.%d, '
+                             'trying IPP/1.0...\n' % (request.version[0], 
+                                                      request.version[1]))
+            # switch to IPP version 1.0
+            ipp_version = [1, 0]
+            request.version = ipp_version
+        elif ipp_response.operation_id == pkipplib.IPP_NOT_FOUND:
+            sys.stderr.write('ERROR: Destination printer does not exist!\n')
+            sys.exit(CUPS_BACKEND_STOP)
+        else:
+            sys.stderr.write('ERROR: Unable to get printer status!  IPP '
+                             'status code: %s\n' % 
+                             (hex(ipp_response.operation_id)))
+            time.sleep(10)
+        
+        # cups-1.3.7/backend/ipp.c 732
+        report_printer_state(ipp_response, args['job_id'])
+        
+        ipp_response = ntlm_conn.doRequest(request)
+
+    # cups-1.3.7/backend/ipp.c 708-718
+    if 'copies-supported' not in ipp_response.printer_attributes or \
+            ipp_response.printer_attributes['copies-supported'][0] <= 1:
+        copies_supported = False
+    else:
+        copies_supported = True
+    
+    # cups-1.3.7/backend/ipp.c 720-730
+    supported_formats = []
+    if 'document-format-supported' in ipp_response.printer_attributes:
+        sys.stderr.write('DEBUG: document-format-supported: %s\n' %
+                ipp_response.printer_attributes['document-format-supported'])
+        for format in ipp_response.printer_attributes['document-format-supported']:
+            supported_formats.append(format)
+
+    if debug:
+        sys.stderr.write('DEBUG: copies_supported: %s\n' % (copies_supported))
+        sys.stderr.write('DEBUG: supported_formats: %s\n' % 
+                         (supported_formats))
+        sys.stderr.write('DEBUG: IPP_GET_PRINTER_ATTRIBUTES response code: '
+                         '%s\n' % (hex(ipp_response.operation_id)))
+
+    # cups-1.3.7/backend/ipp.c 736-779
+    if 'CLASS' in os.environ:
+        if 'printer-state' not in ipp_response.printer_attributes or \
+                int(ipp_response.printer_attributes['printer-state'][0]) > \
+                pkipplib.IPP_PRINTER_PROCESSING or \
+                'printer-is-accepting-jobs' not in ipp_response.printer_attributes or \
+                ipp_response.printer_attributes['printer-is-accepting-jobs'][0] == False:
+            sys.stderr.write('INFO: Unable to contact printer, queuing on '
+                             'next printer in class...\n')
+            # delete all temp files that were created
+            for file in temp_filenames:
+                os.remove(file)
+            time.sleep(5)
+            sys.exit(CUPS_BACKEND_FAILED)
+    
+    # cups-1.3.7/backend/ipp.c 781-791
+    if recoverable:
+        sys.stderr.write('INFO: recovered: \n')
+        time.sleep(5)
+    
+    # cups-1.3.7/backend/ipp.c 793-807
+    copies = int(args['job_copies'])
+    if (copies_supported) or len(sys.argv) < 7:
+        copies_remaining = 1
+        if len(sys.argv) < 7:
+            copies = 1
+    else:
+        copies_remaining = copies
+  
+    job_id = 0
+    
+    # cups-1.3.7/backend/ipp.c 815-1170
+    while copies_remaining > 0:
+        if job_cancelled:
+            break
+        if num_files > 1:
+            request = ntlm_conn.newRequest(pkipplib.IPP_CREATE_JOB)
+        else:
+            request = ntlm_conn.newRequest(pkipplib.IPP_PRINT_JOB)
+        request.version = ipp_version
+        request.operation['printer-uri'] = ('uri', ntlm_url)
+        sys.stderr.write('DEBUG: printer-uri = "%s"\n' % (ntlm_url))
+        
+        # cups-1.3.7/backend/ipp.c 836-840
+        if args['job_user'] != '':
+            request.operation['requesting-user-name'] = ('nameWithoutLanguage', 
+                                                         args['job_user'])
+            sys.stderr.write('DEBUG: requesting-user-name = "%s"\n' % 
+                             (args['job_user']))
+        
+        # cups-1.3.7/backend/ipp.c 848-852
+        if (args['job_name'] != '') and (copies_supported):
+            request.operation['job-name'] = ('nameWithoutLanguage', 
+                                              args['job_name'])
+            sys.stderr.write('DEBUG: job-name = "%s"\n' % (args['job_name']))
+        
+        # cups-1.3.7/backend/ipp.c 854-858
+        if compression:
+            request.operation['keyword'] = ('compression', 'gzip')
+
+#@todo: handle apple here (cups-1.3.7/backend/ipp.c 867)
+
+        # cups-1.3.7/backend/ipp.c 911-920
+        if supported_formats:  # cups-1.3.7/backend/ipp.c 911-920
+            for format in supported_formats:
+                if format.lower() == final_content_type.lower():
+                    request.operation['document-format'] = ('mimeMediaType', 
+                            final_content_type)
+
+        # don't worry about implementing this right now because we're only using IPP 1.0
+        # cups-1.3.7/backend/ipp.c 922-937
+        #if (copies_supported) and ipp_version[0] >= 1 and \
+        #        request.version[1] > 0 and send_options:
+        
+        # cups-1.3.7/backend/ipp.c 955-958
+        if num_files > 1:
+            ipp_response = ntlm_conn.doRequest(request)
+        else:
+            ipp_response = ntlm_conn.doFileRequest(request, files[0])
+
+        # cups-1.3.7/backend/ipp.c 962-992
+        if ipp_response.operation_id > pkipplib.IPP_OK_CONFLICT:
+            job_id = 0
+            
+            if job_cancelled:
+                break
+            
+            if ipp_response.operation_id == pkipplib.IPP_PRINTER_BUSY or \
+                ipp_response.operation_id == pkipplib.IPP_SERVICE_UNAVAILABLE:
+                sys.stderr.write('INFO: Printer busy; will retry in 10 '
+                                 'seconds...\n')
+                time.sleep(10)
+            # don't worry about implementing this right now because we're only using IPP 1.0
+            # cups-1.3.7/backend/ipp.c 976-988
+            else:
+                sys.stderr.write('ERROR: Print file was not accepted!  IPP '
+                                 'status code: %s\n' % 
+                                 (hex(ipp_response.operation_id)))
+        
+        # cups-1.3.7/backend/ipp.c 993-999
+        elif 'job-id' not in ipp_response.job_attributes:
+            sys.stderr.write('NOTICE: Print file accepted - job ID unknown.\n')
+            job_id = 0
+        
+        # cups-1.3.7/backend/ipp.c 1000-1005
+        else:
+            job_id = int(ipp_response.job_attributes['job-id'][0])
+            sys.stderr.write('NOTICE: Print file accepted - job ID %d.\n' %
+                             (job_id))
+        
+        # cups-1.3.7/backend/ipp.c 1009-1010
+        if job_cancelled:
+            break
+        
+        # cups-1.3.7/backend/ipp.c 1012-1048
+        if (job_id) and (num_files > 1):
+            for i in range(len(files)):
+                request = ntlm_conn.newRequest(pkipplib.IPP_SEND_DOCUMENT)
+                request.version = ipp_version
+                request.operation['printer-uri'] = ('uri', ntlm_url)
+                request.operation['job-id'] = ('integer', job_id)
+                
+                if args['job_user'] != '':
+                    request.operation['requesting-user-name'] = \
+                            ('nameWithoutLanguage', args['job_user'])
+                
+                if (i + 1) == num_files:
+                    request.operation['last-document'] = ('boolean', 1)
+                    
+                request.operation['document-format'] = ('mimeMediaType', 
+                            content_type)
+        
+                ipp_response = ntlm_conn.doFileRequest(request, files[i])
+                
+                if ipp_response.operation_id > pkipplib.IPP_OK_CONFLICT:
+                    sys.stderr.write('ERROR: Unable to add file %d to job! '
+                                     'IPP status code: %s\n' % (job_id, 
+                                     hex(ipp_response.operation_id)))
+                    break
+        
+        # cups-1.3.7/backend/ipp.c 1050-1059
+        if ipp_response.operation_id <= pkipplib.IPP_OK_CONFLICT and \
+                len(sys.argv) > 6:
+            if copies_supported:
+                sys.stderr.write('PAGE: 1 %d\n' % (int(args['job_copies'])))
+            else:
+                sys.stderr.write('PAGE: 1 1\n')
+            copies_remaining -= 1
+        elif ipp_response.operation_id == pkipplib.IPP_PRINTER_BUSY or \
+                ipp_response.operation_id == pkipplib.IPP_SERVICE_UNAVAILABLE:
+            break
+        else:
+            copies_remaining -= 1
+        
+        # cups-1.3.7/backend/ipp.c 1061-1068
+        if (not job_id) or (not waitjob):
+            # go to the top of the loop
+            continue
+        
+        sys.stderr.write('INFO: Waiting for job to complete...\n')
+        
+        # cups-1.3.7/backend/ipp.c 1070-
+        delay = 1
+        while not job_cancelled:
+            request = ntlm_conn.newRequest(pkipplib.IPP_GET_JOB_ATTRIBUTES)
+            request.version = ipp_version
+            request.operation['printer-uri'] = ('uri', ntlm_url)
+            request.operation['job-id'] = ('integer', job_id)
+            
+            # cups-1.3.7/backend/ipp.c 1085-1087
+            if args['job_user'] != '':
+                request.operation['requesting-user-name'] = \
+                        ('nameWithoutLanguage', args['job_user'])
+            
+            # cups-1.3.7/backend/ipp.c 1089-1091
+            for attribute in requested_job_attributes:
+                request.operation['requested-attributes'] = \
+                        ('nameWithoutLanguage', attribute)
+            
+            ipp_response = ntlm_conn.doRequest(request)
+            
+            # cups-1.3.7/backend/ipp.c 1103-1113
+            if ipp_response.operation_id == pkipplib.IPP_NOT_FOUND:
+                ipp_response.operation_id = pkipplib.IPP_OK
+                break
+            
+            # cups-1.3.7/backend/ipp.c 1115-1127
+            '''ipp.c doesn't handle 0x0404 (IPP_NOT_POSSIBLE), but that's what
+            Windows IPP seems to be returning when trying to get job 
+            attributes for a specific job
+            '''
+            if ipp_response.operation_id > pkipplib.IPP_OK_CONFLICT:
+                if ipp_response.operation_id == pkipplib.IPP_PRINTER_BUSY or \
+                    ipp_response.operation_id == pkipplib.IPP_SERVICE_UNAVAILABLE or \
+                    ipp_response.operation_id == pkipplib.IPP_NOT_POSSIBLE:
+                    sys.stderr.write('ERROR: Unable to get job %d attributes! '
+                                     'IPP status code: %s\n' % (job_id, 
+                                     hex(ipp_response.operation_id)))
+                    break
+            
+            # cups-1.3.7/backend/ipp.c 1129-1150
+            if ipp_response:
+                if 'job-state' in ipp_response.job_attributes:
+                    job_state = ipp_response.job_attributes['job-state'][0]
+                    
+                    if int(job_state) > pkipplib.IPP_JOB_STOPPED:
+                        if 'job-sheets' in ipp_response.job_attributes:
+                            job_sheets = ipp_response.job_attributes['job-media-sheets-completed'][0]
+                            sys.stderr.write('PAGE: total %d\n' % 
+                                             (int(job_sheets)))
+                        break
+            
+            # cups-1.3.7/backend/ipp.c 1158
+            check_printer_state(ntlm_conn, ntlm_url, job_id, args['job_user'],
+                                ipp_version)
+            
+            # cups-1.3.7/backend/ipp.c 1160-1168
+            time.sleep(delay)
+            delay += 1
+            if delay > 10:
+                delay = 1
+
+    # cups-1.3.7/backend/ipp.c 1176-1177
+    if (job_cancelled) and (job_id):
+        cancel_job(ntlm_conn, ntlm_url, job_id, args['job_user'], ipp_version)
+
+    # cups-1.3.7/backend/ipp.c 1183
+    ipp_status = check_printer_state(ntlm_conn, ntlm_url, job_id, 
+                                     args['job_user'], ipp_version)
+
+    # cups-1.3.7/backend/ipp.c 1193-1206
+    # delete all temp files that were created
+    for file in temp_filenames:
+        os.remove(file)
+
+#@todo: implement 1208-1211 (apple)
+
+    if debug:
+        sys.stderr.write('DEBUG: response code from print job: %s\n' % 
+                         (hex(ipp_response.operation_id)))
+        sys.stderr.write('DEBUG: final IPP status code: %s\n' % 
+                         (hex(ipp_status)))
+    
+    # cups-1.3.7/backend/ipp.c 1213-1230
+    if ipp_status == pkipplib.IPP_NOT_AUTHORIZED:
+        sys.stderr.write('ATTR: auth-info-required=negotiate\n')
+        sys.exit(CUPS_BACKEND_AUTH_REQUIRED)
+    elif ipp_status > pkipplib.IPP_OK_CONFLICT:
+        # not part of ipp.c, but useful to have more information
+        sys.stderr.write('ERROR: final IPP status code: %s\n' % 
+                         (hex(ipp_status)))
+        sys.exit(CUPS_BACKEND_FAILED)
+    else:
+        # cups-1.4.3/backend/ipp.c 1366
+        sys.stderr.write('INFO: Ready to print.\n')
+        sys.exit(CUPS_BACKEND_OK)
+
+
+def parse_args():
+    '''Parse command-line arguments
+    Returns: dict containing argument values
+    '''
+    # cups-1.3.7/backend/ipp.c 201-207
+    if len(sys.argv) < 6:
+        sys.stderr.write('Usage: %s job-id user title copies options [file] '
+                         '\n' % (sys.argv[0]))
+        sys.exit(CUPS_BACKEND_STOP)
+   
+    args = {}
+    args['job_id']       = sys.argv[1]  # The job ID
+    args['job_user']     = sys.argv[2]  # The user printing the job
+    args['job_name']     = sys.argv[3]  # The job name/title
+    args['job_copies']   = sys.argv[4]  # The number of copies to print
+    args['job_options']  = sys.argv[5]  # The options that were provided when the job was submitted
+    if len(sys.argv) > 6:
+        args['job_files'] = []  # The file(s) to print (first program only)
+        for arg_number in range(6, len(sys.argv) - 1):
+            args['job_files'].append(sys.argv[arg_number])
+   
+    return args
+
+
+def separate_uri(uri):
+    if uri.startswith('ntlm'):
+        # urlparse likes a URL that starts with a real URL scheme (go figure)
+        uri = uri.replace('ntlm', 'http', 1)
+    
+    if sys.version_info < (2, 5):
+        class mySplitResult(object):
+            def __init__(self, uri):
+                parsed_uri = urlparse.urlsplit(uri)
+                
+                self.scheme = parsed_uri[0]
+                self.netloc = parsed_uri[1]
+                self.path = parsed_uri[2]
+                self.query = parsed_uri[3]
+                
+                netloc_pattern = re.compile(r'''
+                    ([\w\-\.\\]+(?=(?::[^\s]+(?=@))?@))?  # username (optional)
+                    :?([^\s]+(?=@))?@?  # password (optional)
+                    ([a-zA-Z0-9\-\.]+) # hostname
+                    :?(\d+)? # port (optional)
+                    ''', re.VERBOSE)
+                
+                netloc_match = netloc_pattern.match(self.netloc)
+                
+                if netloc_match:
+                    self.username = netloc_match.group(1)
+                    self.password = netloc_match.group(2)
+                    self.hostname = netloc_match.group(3)
+                    self.port = int(netloc_match.group(4))
+        
+        printer_uri = mySplitResult(uri)
+    
+    else:
+        printer_uri = urlparse.urlsplit(uri)
+    
+    # make the entire query string lowercase since the CUPS IPP module does a 
+    #    case-insensitive comparison on it anyway
+    if sys.version_info < (2, 6):
+        printer_uri.options = cgi.parse_qs(printer_uri.query.lower())
+    else:
+        printer_uri.options = urlparse.parse_qs(printer_uri.query.lower())
+    
+    return printer_uri
+
+
+def create_temp_filename():
+    '''Roughly developed from cupTempFd function in cups-1.3.7/cups/tempfile.c
+    
+    Returns: name of temporary file
+    '''
+    global temp_filenames
+    
+    # make sure files are created with 0600 permissions
+    os.umask(0177)
+    
+    # get the temp directory
+    if 'TMPDIR' not in os.environ or \
+            os.environ['TMPDIR'] == '':
+        if is_osx:
+            temp_dir = '/private/tmp'
+        else:
+            temp_dir = '/tmp'
+    else:
+        temp_dir = os.environ['TMPDIR']
+    
+    # create the file name and make sure it doesn't already exist
+    for tries in range(1000):
+        temp_filename = '%s/%s' % (temp_dir, time.time())
+        if not os.path.isfile(temp_filename) and \
+                not os.path.isdir(temp_filename):
+            break
+    
+    temp_filenames.append(temp_filename)
+    return temp_filename
+
+
+def cancel_job(conn, uri, job_id, user, ipp_version):
+    '''Roughly implemented from cancel_job function in cups-1.3.7/backend/ipp.c
+    '''
+    sys.stderr.write('INFO: Canceling print job...\n')
+    
+    request = conn.newRequest(pkipplib.IPP_CANCEL_JOB)
+    request.version = ipp_version
+    
+    request.operation['printer-uri'] = ('uri', uri)
+    request.operation['job-id'] = ('integer', job_id)
+    
+    if (user != None) and (user != ''):
+        request.operation['requesting-user-name'] = ('nameWithoutLanguage', 
+                                                     user)
+    
+    ipp_response = conn.doRequest(request)
+    
+    if ipp_response.operation_id > pkipplib.IPP_OK_CONFLICT:
+        sys.stderr.write('ERROR: Unable to cancel job %d!  IPP status code: '
+                '%s\n' % (int(job_id), hex(ipp_response.operation_id)))
+
+
+def check_printer_state(conn, uri, job_id, user, ipp_version):
+    '''Roughly implemented from check_printer_state function in cups-1.3.7/backend/ipp.c
+    '''
+    printer_state_attributes = [
+                  'printer-state-message',
+                  'printer-state-reasons',
+                 ]
+    
+    request = conn.newRequest(pkipplib.IPP_GET_PRINTER_ATTRIBUTES)
+    request.version = ipp_version
+    
+    request.operation['printer-uri'] = ('uri', uri)
+
+    if (user != None) and (user != ''):
+        request.operation['requesting-user-name'] = ('nameWithoutLanguage', 
+                                                     user)
+    
+    for attribute in printer_state_attributes:
+        request.operation['requested-attributes'] = ('nameWithoutLanguage', 
+                                                     attribute)
+    
+    ipp_response = conn.doRequest(request)
+    
+    if ipp_response:
+        report_printer_state(ipp_response, job_id)
+    
+    '''This function in ipp.c doesn't return anything, but we will in order
+    to have some useful information when the script finishes 
+    '''
+    return ipp_response.operation_id
+
+
+def compress_files(filenames):
+    '''Roughly implemented from compress_files function in 
+    cups-1.3.7/backend/ipp.c 1326-1401
+    Requires: list of filenames of files to compress
+    Returns: list of names of compressed files
+    '''
+    compressed_files = []
+    for filename in filenames:
+        temp_filename = create_temp_filename()
+        try:
+            temp_file = gzip.open(temp_filename, 'wb')
+            infile = open(filename, 'r')
+            temp_file.write(infile.read())
+            infile.close()
+            temp_file.close()
+        except IOError, error:
+            sys.stderr.write('ERROR: IOError: %s\n' % (error))
+            sys.exit(CUPS_BACKEND_FAILED)
+        
+        compressed_files.append(temp_filename)
+    
+    return compressed_files
+
+
+def report_printer_state(ipp_response, job_id):
+    if 'printer-state-message' in ipp_response.printer_attributes:
+        printer_state_message = ipp_response.printer_attributes['printer-state-message'][0]
+        sys.stderr.write('INFO: %s\n' % (printer_state_message))
+    
+    if 'printer-state-reasons' not in ipp_response.printer_attributes:
+        return None
+    
+    else:
+        printer_state_reasons = ipp_response.printer_attributes['printer-state-reasons']
+        
+        state = ''
+        state_prefix = 'STATE: '
+        
+        count = 0
+        for reason in printer_state_reasons:
+            count += 1
+            if reason.find('error') != -1:
+                prefix = 'ERROR'
+            elif printer_sate_reasons.find('warning') != -1:
+                prefix = 'WARNING'
+            else:
+                prefix = 'INFO'
+            
+            if (int(job_id) == 0) or (reason != 'paused'):
+                state = state_prefix + reason
+                state_prefix = ','
+            
+            sys.stdout.write('%s: %s\n' % (prefix, reason))
+            
+        sys.stdout.write('%s\n' % (state))
+
+        return count
+
+
+def sigterm_handler(signal_number, stack_frame):
+    '''Roughly implemented from sigterm_handler function in 
+    cups-1.3.7/backend/ipp.c
+    '''
+    global job_cancelled
+    
+    if not job_cancelled:
+        job_cancelled = True
+        return
+
+    # delete all temp files that were created
+    for file in temp_filenames:
+        os.remove(file)
+
+    sys.exit(CUPS_BACKEND_FAILED)
+
+
+class myIPPRequest(pkipplib.IPPRequest):
+    '''overload pkipplib.IPPRequest class cause it handles attributes in an 
+    ugly way
+    '''
+    # overload __getattr__ so we can do stuff like:
+    #    if attribute in instance.operation_attributes
+    # we also don't care about their IPP attribute type if we're just 
+    #    retreiving them
+    def __getattr__(self, attrname):
+        if attrname.endswith('_attributes'):
+            attrsplit = attrname.split('_')
+            if attrsplit[0] in self.attributes_types:
+                attributes = {}
+                for attribute in (getattr(self, '_%s_attributes' %
+                                          (attrsplit[0])))[0]:
+                    if attribute[0] not in attributes:
+                        attributes[attribute[0]] = []
+                    for value in attribute[1]:
+                        attributes[attribute[0]].append(value[1])
+                return attributes
+        else:
+            '''From pkkipplib.IPPRequest.__getattr__
+            
+            Fakes attribute access.
+            '''
+            if attrname in self.attributes_types:
+                return pkipplib.FakeAttribute(self, attrname)
+            else:
+                raise AttributeError, attrname
+
+
+class ntlmConn(pkipplib.CUPS):
+    '''new class to handle NTLM authentication based on pkipplib CUPS class
+    '''
+    # require the url to be specified for the connection 
+    def __init__(self, url, username=None, password=None, charset='utf-8', 
+                 language='en-us', debug=False):
+        # pass those values on to the pkipplib.CUPS class
+        pkipplib.CUPS.__init__(self, url=url, username=username, 
+                               password=password, charset=charset, 
+                               language=language, debug=debug)
+    def newRequest(self, operation_id=None):
+        '''taken from pkipplib.CUPS.newRequest
+        
+        Generates a new empty request.
+        '''
+        if operation_id is not None :
+            # for now Windows only implements IPP version 1.0, so default to that
+            ipp_version = '1.0'
+            # make use of our myIPPRequest class
+            req = myIPPRequest(operation_id=operation_id, 
+                             request_id=self.nextRequestId(),
+                             debug=self.debug, 
+                             version=ipp_version)
+            req.operation['attributes-charset'] = ('charset', self.charset)
+            req.operation['attributes-natural-language'] = ('naturalLanguage', 
+                                                            self.language)
+            return req
+    def doRequest(self, request):
+        return self.doFileRequest(request, None)
+    def doFileRequest(self, request, filename):
+        '''taken from pkipplib.CUPS.doRequest and modified to handle files 
+        and Windows NTLM auth
+        '''
+        if filename:
+            try:
+                file_to_print = open(filename, 'r')
+                data_to_print = request.dump() + file_to_print.read()
+                file_to_print.close()
+            except IOError, error:
+                sys.stderr.write('ERROR: IOError: %s\n' % (error))
+                sys.exit(CUPS_BACKEND_FAILED)
+        else:
+            data_to_print = request.dump()
+        
+        this_request = urllib2.Request(url=self.url, data=data_to_print)
+        this_request.add_header('Content-Type', 'application/ipp')
+        
+        if (self.username == None) or (self.username == ''):
+            sys.stderr.write('WARNING: no username provided to NTLM backend\n')
+        if (self.password == None) or (self.password == ''):
+            sys.stderr.write('WARNING: no password provided to NTLM backend\n')
+        
+        passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
+        passman.add_password(None, self.url, self.username, self.password)
+        # create the NTLM authentication handler
+        auth_NTLM = HTTPNtlmAuthHandler.HTTPNtlmAuthHandler(passman)
+        # create and install the opener
+        opener = urllib2.build_opener(auth_NTLM)
+        urllib2.install_opener(opener)
+        try:
+            response = urllib2.urlopen(this_request)
+        except (urllib2.URLError, urllib2.HTTPError), error:
+            self.lastError = error
+            self.lastErrorMessage = str(error)
+            return None
+        else:
+            data = response.read()
+            ipp_response = myIPPRequest(data)
+            try:
+                ipp_response.parse()
+            # pkipplib.IPPRequest.parse() chokes every once in a while.  this 
+            #    shouldn't matter if it's on the last byte, which should just 
+            #    be the end of attributes tag (0x03)
+            except struct.error, error:
+                sys.stderr.write('DEBUG: error parsing IPP response at '
+                                 'position %s: %s\n' % 
+                                 (ipp_response.position, error))
+                sys.stderr.write('DEBUG: total IPP response length: %s '
+                                 'bytes\n' % len(ipp_response._data))
+            return ipp_response        
+
+
+# calls the main() function
+if __name__=='__main__':
+    main()
+
+
+'''
+@todo:
+    implement apple functions
+    see if any features of cups-1.4.2/3 we should implement...
+'''
